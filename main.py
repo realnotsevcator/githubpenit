@@ -197,6 +197,7 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
             return
 
         if "irz" not in driver.title.lower():
+            host.decrement_attempt()
             log_line(f"[{host.address}] [n/a] [Failed] (missing iRZ)")
             return
 
@@ -211,6 +212,7 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
         while True:
             with ctx.credential_lock:
                 if not ctx.credential_queue:
+                    host.decrement_attempt()
                     log_line(f"[{host.address}] [n/a] [Failed] (no credentials left)")
                     return
                 credential = ctx.credential_queue.popleft()
@@ -225,7 +227,13 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
                 return
 
             if outcome == LoginOutcome.FAIL:
+                host.decrement_attempt()
                 log_line(f"[{host.address}] [{credential.username}:{credential.password}] [Failed] (unhandled)")
+                return
+
+            host.decrement_attempt()
+            if host.is_exhausted:
+                log_line(f"[{host.address}] [{credential.username}:{credential.password}] [Failed] (auth, attempts exhausted)")
                 return
 
             log_line(f"[{host.address}] [{credential.username}:{credential.password}] [Failed] (auth)")
