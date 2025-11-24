@@ -95,6 +95,7 @@ def create_driver(browser: str) -> webdriver.Remote:
         chrome_options.add_argument("--ignore-certificate-errors")
         chrome_options.add_argument("--start-maximized")
         driver = webdriver.Chrome(options=chrome_options)
+    driver.set_page_load_timeout(30)
     return driver
 
 
@@ -111,7 +112,9 @@ def wait_for_page(driver: webdriver.Remote, timeout: int = 10) -> bool:
 def try_load(driver: webdriver.Remote, base: str) -> bool:
     try:
         driver.get(base)
-    except WebDriverException:
+    except (TimeoutException, WebDriverException):
+        return False
+    except Exception:
         return False
     return wait_for_page(driver)
 
@@ -238,6 +241,13 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
 
             log_line(f"[{host.address}] [{credential.username}:{credential.password}] [Failed] (auth)")
             time.sleep(1)
+    except Exception as exc:  # catch-all to keep worker thread alive
+        host.decrement_attempt()
+        log_line(
+            f"[{host.address}] [{credential.username if credential else 'n/a'}] "
+            f"[Failed] (error: {exc.__class__.__name__})"
+        )
+        return
     finally:
         if driver:
             driver.quit()
