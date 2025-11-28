@@ -132,6 +132,26 @@ def try_load(driver: webdriver.Remote, base: str) -> bool:
     return wait_for_page(driver)
 
 
+def determine_protocol_order(driver: webdriver.Remote, host: HostEntry) -> Optional[List[str]]:
+    attempts_left = DEFAULT_ATTEMPTS
+    while attempts_left > 0:
+        available: List[str] = []
+
+        if try_load(driver, f"http://{host.address}"):
+            available.append("http")
+        if try_load(driver, f"https://{host.address}"):
+            available.append("https")
+
+        if available:
+            if available[0] == "http":
+                return ["http", "https"]
+            return ["https", "http"]
+
+        attempts_left -= 1
+
+    return None
+
+
 def find_irz_anchor(driver: webdriver.Remote) -> Optional[webdriver.remote.webelement.WebElement]:
     candidates = [
         (By.XPATH, "//a[@href='cgi-bin/index.cgi']"),
@@ -200,33 +220,24 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
     try:
         driver = create_driver(ctx.browser)
 
-        protocol_order = []
-        if try_load(driver, f"http://{host.address}"):
-            protocol_order.append("http")
-        elif try_load(driver, f"https://{host.address}"):
-            protocol_order.append("https")
+        protocol_order = determine_protocol_order(driver, host)
 
         if not protocol_order:
-            host.decrement_attempt()
+            host.attempts = 0
             log_line(f"[{host.address}] [n/a] [Failed] (connection)")
             return
 
-        if protocol_order[0] == "http":
-            protocol_order.append("https")
-        else:
-            protocol_order.append("http")
+        with ctx.credential_lock:
+            credentials_to_try = list(ctx.credential_queue)
 
-        while True:
-            with ctx.credential_lock:
-                if not ctx.credential_queue:
-                    host.decrement_attempt()
-                    log_line(f"[{host.address}] [n/a] [Failed] (no credentials left)")
-                    return
-                credential = ctx.credential_queue.popleft()
-                ctx.credential_queue.append(credential)
+        if not credentials_to_try:
+            host.attempts = 0
+            log_line(f"[{host.address}] [n/a] [Failed] (no credentials left)")
+            return
 
+        last_reason = "unhandled"
+        for credential in credentials_to_try:
             outcome = LoginOutcome.FAIL
-            last_reason = "unhandled"
 
             for protocol in protocol_order:
                 auth_url = f"{protocol}://{credential.username}:{credential.password}@{host.address}"
@@ -256,26 +267,26 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
                         f"[{host.address}] [{credential.username}:{credential.password}] "
                         f"[Success] ({protocol})"
                     )
+                    host.attempts = 0
                     return
 
                 last_reason = (
                     "auth" if outcome == LoginOutcome.RETRY_CREDENTIAL else "unhandled"
                 )
 
-            host.decrement_attempt()
-            if host.is_exhausted:
-                log_line(
-                    f"[{host.address}] [{credential.username}:{credential.password}] "
-                    f"[Failed] ({last_reason}, attempts exhausted)"
-                )
-                return
-
             log_line(
-                f"[{host.address}] [{credential.username}:{credential.password}] [Failed] ({last_reason})"
+                f"[{host.address}] [{credential.username}:{credential.password}] "
+                f"[Failed] ({last_reason})"
             )
-            time.sleep(1)
+
+        host.attempts = 0
+        log_line(
+            f"[{host.address}] [{credential.username if credential else 'n/a'}] "
+            f"[Failed] ({last_reason}, credentials exhausted)"
+        )
+        time.sleep(1)
     except Exception as exc:  # catch-all to keep worker thread alive
-        host.decrement_attempt()
+        host.attempts = 0
         log_line(
             f"[{host.address}] [{credential.username if credential else 'n/a'}] "
             f"[Failed] (error: {exc.__class__.__name__})"
