@@ -83,6 +83,19 @@ def parse_file_lines(path: Path, separator: str) -> List[Tuple[str, str]]:
     return pairs
 
 
+def parse_single_column(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    entries: List[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            value = raw.strip()
+            if value:
+                entries.append(value)
+    return entries
+
+
 def create_driver(browser: str) -> webdriver.Remote:
     if browser.lower() == "ie":
         options = IeOptions()
@@ -296,6 +309,14 @@ def build_context(args: argparse.Namespace) -> AutomationContext:
         credential_queue = deque(
             CredentialEntry(username=user, password=pwd) for user, pwd in credential_pairs
         )
+    elif args.user_file and args.password_file:
+        users = parse_single_column(Path(args.user_file))
+        passwords = parse_single_column(Path(args.password_file))
+        credential_queue = deque(
+            CredentialEntry(username=user, password=pwd)
+            for user in users
+            for pwd in passwords
+        )
     else:
         credential_queue = deque(
             [CredentialEntry(username=args.username, password=args.password)]
@@ -313,15 +334,22 @@ def build_context(args: argparse.Namespace) -> AutomationContext:
 
 
 def prompt_for_missing(args: argparse.Namespace) -> None:
-    if not args.credential_file:
+    if not args.credential_file and not (args.user_file and args.password_file):
         if not args.username:
             args.username = input("Username: ").strip()
         if not args.password:
             args.password = input("Password: ").strip()
         if not args.username or not args.password:
-            args.credential_file = input(
-                "Path to credentials file (username;password): "
-            ).strip()
+            if not args.user_file:
+                args.user_file = input("Path to username file (one per line): ").strip()
+            if not args.password_file:
+                args.password_file = input(
+                    "Path to password file (one per line): "
+                ).strip()
+            if not (args.user_file and args.password_file):
+                args.credential_file = input(
+                    "Path to credentials file (username;password): "
+                ).strip()
     if not args.host_file:
         args.host_file = input("Path to hosts file (IP:Port): ").strip()
     if args.multiwindow is None:
@@ -332,6 +360,8 @@ def prompt_for_missing(args: argparse.Namespace) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Automate iRZ login attempts")
     parser.add_argument("--credential-file", dest="credential_file", help="Path to txt with username;password entries")
+    parser.add_argument("--user-file", dest="user_file", help="Path to txt with usernames (one per line)")
+    parser.add_argument("--password-file", dest="password_file", help="Path to txt with passwords (one per line)")
     parser.add_argument("--username", help="Single username to use when no credential file is provided")
     parser.add_argument("--password", help="Password matching --username when no credential file is provided")
     parser.add_argument("--host-file", dest="host_file", help="Path to txt with IP:Port entries")
@@ -342,8 +372,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     prompt_for_missing(args)
 
-    if not args.credential_file and (not args.username or not args.password):
-        log_line("Username and password are required when no credential file is provided.")
+    if not args.credential_file and not (
+        args.username
+        and args.password
+        or (args.user_file and args.password_file)
+    ):
+        log_line(
+            "Provide either --credential-file, --username/--password, or --user-file/--password-file."
+        )
         return 1
 
     ctx = build_context(args)
