@@ -245,7 +245,9 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
                     )
                     return
 
-                last_reason = "auth" if outcome == LoginOutcome.RETRY else "unhandled"
+                last_reason = (
+                    "auth" if outcome == LoginOutcome.RETRY_CREDENTIAL else "unhandled"
+                )
 
             host.decrement_attempt()
             if host.is_exhausted:
