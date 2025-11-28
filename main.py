@@ -291,8 +291,15 @@ def build_context(args: argparse.Namespace) -> AutomationContext:
     host_pairs = parse_file_lines(Path(args.host_file), ":")
     hosts = deque(HostEntry(address=f"{ip}:{port}") for ip, port in host_pairs)
 
-    credential_pairs = parse_file_lines(Path(args.credential_file), ";")
-    credential_queue = deque(CredentialEntry(username=user, password=pwd) for user, pwd in credential_pairs)
+    if args.credential_file:
+        credential_pairs = parse_file_lines(Path(args.credential_file), ";")
+        credential_queue = deque(
+            CredentialEntry(username=user, password=pwd) for user, pwd in credential_pairs
+        )
+    else:
+        credential_queue = deque(
+            [CredentialEntry(username=args.username, password=args.password)]
+        )
 
     return AutomationContext(
         browser=args.browser,
@@ -307,7 +314,14 @@ def build_context(args: argparse.Namespace) -> AutomationContext:
 
 def prompt_for_missing(args: argparse.Namespace) -> None:
     if not args.credential_file:
-        args.credential_file = input("Path to credentials file (username;password): ").strip()
+        if not args.username:
+            args.username = input("Username: ").strip()
+        if not args.password:
+            args.password = input("Password: ").strip()
+        if not args.username or not args.password:
+            args.credential_file = input(
+                "Path to credentials file (username;password): "
+            ).strip()
     if not args.host_file:
         args.host_file = input("Path to hosts file (IP:Port): ").strip()
     if args.multiwindow is None:
@@ -318,6 +332,8 @@ def prompt_for_missing(args: argparse.Namespace) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Automate iRZ login attempts")
     parser.add_argument("--credential-file", dest="credential_file", help="Path to txt with username;password entries")
+    parser.add_argument("--username", help="Single username to use when no credential file is provided")
+    parser.add_argument("--password", help="Password matching --username when no credential file is provided")
     parser.add_argument("--host-file", dest="host_file", help="Path to txt with IP:Port entries")
     parser.add_argument("--multiwindow", type=int, help="Number of concurrent browser windows")
     parser.add_argument("--browser", choices=["chromium", "ie"], default="chromium", help="Browser type")
@@ -325,6 +341,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
     prompt_for_missing(args)
+
+    if not args.credential_file and (not args.username or not args.password):
+        log_line("Username and password are required when no credential file is provided.")
+        return 1
 
     ctx = build_context(args)
     if not ctx.hosts:
