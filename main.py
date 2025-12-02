@@ -3,23 +3,20 @@ import time
 import threading
 import queue
 import gc
+import re
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+import requests
+import urllib3
 
 
 GOOD_FILE = "good.txt"
-MAX_WORKERS = 20             # exactly 3 browsers at the same time
+MAX_WORKERS = 500            # number of worker threads
 MAX_ATTEMPTS = 3            # attempts per target
 TIMEOUT_SECONDS = 20        # <-- your 20-second timeout
-PAGE_LOAD_TIMEOUT = TIMEOUT_SECONDS
-WAIT_BODY_TIMEOUT = TIMEOUT_SECONDS
 QUEUE_MAXSIZE = 1000        # limit queued tasks to save memory
+
+# Disable SSL warnings because we intentionally allow self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TASK_QUEUE: queue.Queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
 STOP_SIGNAL = object()      # sentinel object to stop workers
@@ -96,40 +93,24 @@ def write_good_line(line: str):
             f.write(line + "\n")
 
 
-# ---------- SELENIUM SETUP ----------
-
-# Install chromedriver once and reuse path
-CHROME_DRIVER_PATH = ChromeDriverManager().install()
+# ---------- HTTP REQUEST HANDLING ----------
 
 
-def create_driver():
+def extract_title(html: str) -> str:
+    """Return the contents of the first <title> tag found in HTML."""
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def handle_target_with_session(session: requests.Session, proto: str, ip: str, port: str):
     """
-    Create a headless Chrome driver with basic options.
-    Called once per worker thread and reused for many URLs.
-    """
-    chrome_options = Options()
-    chrome_options.add_argument("--ignore-certificate-errors")
-    chrome_options.add_argument("--ignore-ssl-errors=yes")
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-
-    service = Service(CHROME_DRIVER_PATH)
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-    return driver
-
-
-# ---------- URL PROCESSING WITH SELENIUM ----------
-
-def handle_target_with_driver(driver, proto: str, ip: str, port: str):
-    """
-    Open URL with the given Selenium driver and process result.
+    Fetch URL over HTTP/HTTPS, following redirects, and process the final page.
 
     On success:
-        - Console: protocol - IP:Port > Page Title
-        - good.txt: <protocol>://ip:port/ | Page Title
+        - Console: protocol - IP:Port > FinalURL | Page Title
+        - good.txt: FinalURL | Page Title
 
     On final failure:
         - Console: protocol - IP:Port ! FAIL
@@ -138,31 +119,30 @@ def handle_target_with_driver(driver, proto: str, ip: str, port: str):
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            driver.get(url)
+            response = session.get(
+                url,
+                timeout=TIMEOUT_SECONDS,
+                allow_redirects=True,
+                verify=False,
+            )
 
-            # Try to wait for <body>, but ignore if timeout
-            try:
-                WebDriverWait(driver, WAIT_BODY_TIMEOUT).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-            except Exception:
-                # Even if body wait fails, we still can read the title
-                pass
+            # Ensure we landed on a final (non-redirect) successful page
+            if response.status_code >= 400:
+                raise requests.HTTPError(f"bad status: {response.status_code}")
+            if 300 <= response.status_code < 400:
+                raise requests.HTTPError("redirect chain did not reach final page")
 
-            title = driver.title or ""
+            html = response.text or ""
+            title = extract_title(html)
+            final_url = response.url
 
-            # SUCCESS line to console:
-            # protocol - IP:Port > Page Title
-            safe_print(f"{proto} - {ip}:{port} > {title}")
-
-            # Update good.txt immediately
-            write_good_line(f"{url} | {title}")
+            safe_print(f"{proto} - {ip}:{port} > {final_url} | {title}")
+            write_good_line(f"{final_url} | {title}")
 
             return  # success, stop attempts
 
-        except Exception:
+        except requests.RequestException:
             if attempt == MAX_ATTEMPTS:
-                # Final failure
                 safe_print(f"{proto} - {ip}:{port} ! FAIL")
             else:
                 time.sleep(1.0)
@@ -173,11 +153,11 @@ def handle_target_with_driver(driver, proto: str, ip: str, port: str):
 def worker_loop(worker_id: int):
     """
     Worker thread:
-    - creates its own Selenium driver once
+    - creates its own requests session once
     - takes tasks from TASK_QUEUE
     - stops when receives STOP_SIGNAL
     """
-    driver = create_driver()
+    session = requests.Session()
     try:
         while True:
             task = TASK_QUEUE.get()
@@ -187,14 +167,14 @@ def worker_loop(worker_id: int):
                     break
 
                 proto, ip, port = task
-                handle_target_with_driver(driver, proto, ip, port)
+                handle_target_with_session(session, proto, ip, port)
 
                 TASK_QUEUE.task_done()
             except Exception:
                 TASK_QUEUE.task_done()
     finally:
-        driver.quit()
-        del driver
+        session.close()
+        del session
         gc.collect()
 
 
