@@ -4,7 +4,8 @@ import requests
 import urllib3
 
 MAX_ATTEMPTS = 3
-TIMEOUT_SECONDS = 20
+CONNECT_TIMEOUT_SECONDS = 20
+READ_TIMEOUT_SECONDS = 60
 
 # Disable SSL warnings because we intentionally allow self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -45,7 +46,7 @@ def fetch_target(session: requests.Session, proto: str, ip: str, port: str) -> b
         try:
             response = session.get(
                 url,
-                timeout=TIMEOUT_SECONDS,
+                timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
                 allow_redirects=True,
                 verify=False,
             )

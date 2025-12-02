@@ -10,10 +10,11 @@ import urllib3
 
 
 GOOD_FILE = "good.txt"
-MAX_WORKERS = 500            # number of worker threads
-MAX_ATTEMPTS = 3            # attempts per target
-TIMEOUT_SECONDS = 20        # <-- your 20-second timeout
-QUEUE_MAXSIZE = 1000        # limit queued tasks to save memory
+MAX_WORKERS = 500             # number of worker threads
+MAX_ATTEMPTS = 3             # attempts per target
+CONNECT_TIMEOUT_SECONDS = 20  # connection timeout
+READ_TIMEOUT_SECONDS = 60     # allow slower servers to finish sending pages
+QUEUE_MAXSIZE = 1000         # limit queued tasks to save memory
 
 # Disable SSL warnings because we intentionally allow self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -121,7 +122,7 @@ def handle_target_with_session(session: requests.Session, proto: str, ip: str, p
         try:
             response = session.get(
                 url,
-                timeout=TIMEOUT_SECONDS,
+                timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
                 allow_redirects=True,
                 verify=False,
             )
